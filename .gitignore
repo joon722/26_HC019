@@ -1,0 +1,7 @@
+arduino/**/config.h
+*.tmp
+*.log
+__pycache__/
+*.py[cod]
+*.lnk
+tmp/

@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""Tests for step 7 risk scoring: vendored team table + DCPA suppression gate."""
+
+import unittest
+
+from step6_kinematics import relative_kinematics
+from step7_risk import (
+    CLOSING_DOPPLER_MARGIN_MPS,
+    DCPA_FAR_M,
+    DCPA_FLOOR,
+    DCPA_NEAR_M,
+    MIN_CLOSING_MPS,
+    NEAR_FLOOR_M,
+    T_ALARM_MAX_TTC_S,
+    T_FLOOR_TTC_S,
+    TREND_MIN_MPS,
+    assess_risk,
+    calculate_risk_score,
+    calculate_ttc,
+    classify_risk_level,
+    dcpa_gate,
+)
+
+
+class VendoredTeamTableTest(unittest.TestCase):
+    """The three scoring functions are a verbatim copy of the team table.
+
+    These are frozen regression values computed from that table, so a change to
+    the copied numbers is caught here rather than silently diverging.
+    """
+
+    def test_close_head_on_scores_level_3(self):
+        ttc = calculate_ttc(8.0, 5.0)  # 1.6 s
+        score = calculate_risk_score(8.0, 5.0, 5.0, ttc)
+        self.assertEqual(score, 71.0)  # 30 + 30 + 8 + 3
+        self.assertEqual(classify_risk_level(score), 3)
+
+    def test_distant_slow_approach_scores_level_1(self):
+        ttc = calculate_ttc(50.0, 5.0)  # 10 s
+        score = calculate_risk_score(50.0, 5.0, 5.0, ttc)
+        self.assertEqual(score, 29.0)  # 10 + 8 + 8 + 3
+        self.assertEqual(classify_risk_level(score), 1)
+
+    def test_fast_close_approach_saturates_high(self):
+        ttc = calculate_ttc(8.0, 25.0)  # 0.32 s
+        score = calculate_risk_score(8.0, 25.0, 25.0, ttc)
+        self.assertEqual(score, 95.0)  # 30 + 35 + 20 + 10
+        self.assertEqual(classify_risk_level(score), 3)
+
+    def test_stationary_vehicle_scores_only_distance(self):
+        ttc = calculate_ttc(8.0, 0.0)  # 9999, no approach
+        score = calculate_risk_score(8.0, 0.0, 0.0, ttc)
+        self.assertEqual(score, 30.0)  # distance only
+        self.assertEqual(classify_risk_level(score), 1)
+
+    def test_ttc_is_infinite_when_not_approaching(self):
+        self.assertEqual(calculate_ttc(10.0, 0.0), 9999.0)
+        self.assertEqual(calculate_ttc(10.0, -3.0), 9999.0)
+
+
+class DcpaGateTest(unittest.TestCase):
+    def test_missing_dcpa_does_not_suppress(self):
+        # A receding or stationary pair has no closest approach ahead; there is
+        # nothing to gate, so the team table's own low score stands.
+        self.assertEqual(dcpa_gate(None), 1.0)
+
+    def test_dead_centre_is_not_suppressed(self):
+        self.assertEqual(dcpa_gate(0.0), 1.0)
+
+    def test_inside_the_near_margin_is_not_suppressed(self):
+        self.assertEqual(dcpa_gate(DCPA_NEAR_M), 1.0)
+
+    def test_beyond_the_far_margin_is_floored(self):
+        self.assertEqual(dcpa_gate(DCPA_FAR_M), DCPA_FLOOR)
+        self.assertEqual(dcpa_gate(100.0), DCPA_FLOOR)
+
+    def test_midpoint_interpolates_linearly(self):
+        midpoint = (DCPA_NEAR_M + DCPA_FAR_M) / 2
+        expected = 1.0 + 0.5 * (DCPA_FLOOR - 1.0)
+        self.assertAlmostEqual(dcpa_gate(midpoint), expected, places=9)
+
+    def test_gate_is_monotonically_non_increasing(self):
+        values = [dcpa_gate(d) for d in [0.0, 1.0, 2.5, 4.0, 5.0, 6.0, 7.5, 20.0]]
+        for earlier, later in zip(values, values[1:]):
+            self.assertGreaterEqual(earlier, later)
+
+
+class AssessRiskTest(unittest.TestCase):
+    def test_head_on_collision_course_is_not_gated_and_stays_high(self):
+        """Vehicle 8 m due north, driving straight in. dcpa=0 -> gate is a no-op."""
+        kin = relative_kinematics(
+            cane_pos=(0.0, 0.0),
+            cane_vel=(0.0, 0.0),
+            veh_pos=(0.0, 8.0),
+            veh_vel=(0.0, -5.0),
+        )
+        result = assess_risk(kin, vehicle_speed_mps=5.0)
+        self.assertEqual(result.gate, 1.0)
+        self.assertEqual(result.final_score, result.base_score)
+        self.assertEqual(result.risk_level, 3)
+
+    def test_wide_glancing_pass_is_suppressed_below_the_head_on_case(self):
+        """Same speed and similar range, but the car misses by 9 m.
+
+        Without the gate this scores level 2 on the team table; the gate must
+        pull it down because the vehicle never actually reaches the cane.
+        """
+        kin = relative_kinematics(
+            cane_pos=(0.0, 0.0),
+            cane_vel=(0.0, 0.0),
+            veh_pos=(9.0, 8.0),
+            veh_vel=(0.0, -5.0),
+        )
+        self.assertGreaterEqual(kin.dcpa, DCPA_FAR_M)  # a clear miss
+
+        result = assess_risk(kin, vehicle_speed_mps=5.0)
+        self.assertEqual(result.gate, DCPA_FLOOR)
+        self.assertEqual(classify_risk_level(result.base_score), 2)  # ungated
+        self.assertLess(result.risk_level, 2)  # gated down
+        self.assertAlmostEqual(result.final_score, result.base_score * DCPA_FLOOR, places=2)
+
+    def test_receding_vehicle_has_no_gate_and_is_not_an_alarm(self):
+        kin = relative_kinematics(
+            cane_pos=(0.0, 0.0),
+            cane_vel=(0.0, 0.0),
+            veh_pos=(0.0, 8.0),
+            veh_vel=(0.0, 5.0),
+        )
+        self.assertIsNone(kin.dcpa)
+        result = assess_risk(kin, vehicle_speed_mps=5.0)
+        self.assertEqual(result.gate, 1.0)
+        # 8/12 이전에는 거리 항(8 m -> 30점)만으로 레벨 1이 나갔다. 그 규칙이
+        # 그날 경보 1004건 중 506건(접근하지 않는 쌍)을 만들었다. 지금은 TTC
+        # 상한이 걸러낸다 - 점수는 기록용으로 남고 레벨만 0이 된다.
+        self.assertEqual(result.risk_level, 0)
+        self.assertEqual(result.reason, "ttc_capped")
+        self.assertEqual(result.final_score, 33.0)  # 거리 30 + 차량속도 3
+
+
+class TtcCapTest(unittest.TestCase):
+    """접근이 무의미하게 먼 쌍은 경보하지 않는다.
+
+    8/12 실측: 경보 1004건 중 접근 안 함(TTC 9999) 50.4% + TTC 30초 초과
+    23.6% = 74%가 위험이 아닌데 울렸다. 반대로 실제 접근 구간의 TTC는
+    3.7~9.1초로 전부 30초 안이었다 - 상한 30초는 진짜 위험을 하나도 걸지
+    않으면서 그 74%를 걸러낸다.
+
+    상한은 규칙 레벨에만 걸린다. 모델은 여전히 위로 올릴 수 있다 - TTC가
+    무한대인 측면 위험을 잡는 것이 모델의 존재 이유라서, 모델까지 막으면
+    모델을 두는 의미가 없다. 안전 하한(TTC<=T_FLOOR)은 상한보다 먼저
+    판정되므로 서로 겹칠 일이 없다.
+    """
+
+    def test_stationary_pair_nearby_is_silent(self):
+        # 8/12에 가장 흔했던 오경보: 둘 다 정지, 7 m -> 레벨 1 진동.
+        kin = relative_kinematics(
+            cane_pos=(0.0, 0.0),
+            cane_vel=(0.0, 0.0),
+            veh_pos=(0.0, 7.0),
+            veh_vel=(0.0, 0.0),
+        )
+        result = assess_risk(kin, vehicle_speed_mps=0.0)
+        self.assertEqual(result.risk_level, 0)
+        self.assertEqual(result.reason, "ttc_capped")
+
+    def test_very_slow_convergence_beyond_the_cap_is_silent(self):
+        # 50 m 를 1 m/s 로 접근 -> TTC 50초. 어제 지도에 51초짜리가 올라갔었다.
+        kin = relative_kinematics(
+            cane_pos=(0.0, 0.0),
+            cane_vel=(0.0, 0.0),
+            veh_pos=(0.0, 50.0),
+            veh_vel=(0.0, -1.0),
+        )
+        self.assertGreater(kin.ttc_simple, T_ALARM_MAX_TTC_S)
+        result = assess_risk(kin, vehicle_speed_mps=1.0)
+        self.assertEqual(result.risk_level, 0)
+        self.assertEqual(result.reason, "ttc_capped")
+
+    def test_real_approach_inside_the_cap_is_untouched(self):
+        # 50 m 를 10 m/s 로 접근 -> TTC 5초. 기존 채점 그대로.
+        kin = relative_kinematics(
+            cane_pos=(0.0, 0.0),
+            cane_vel=(0.0, 0.0),
+            veh_pos=(0.0, 50.0),
+            veh_vel=(0.0, -10.0),
+        )
+        self.assertLess(kin.ttc_simple, T_ALARM_MAX_TTC_S)
+        result = assess_risk(kin, vehicle_speed_mps=10.0)
+        self.assertEqual(result.reason, "table")
+        self.assertEqual(result.risk_level, classify_risk_level(result.final_score))
+        self.assertGreaterEqual(result.risk_level, 1)
+
+    def test_safety_floor_wins_over_the_cap(self):
+        # 하한 안쪽이면 상한 판정 자체가 일어나지 않는다.
+        kin = relative_kinematics(
+            cane_pos=(0.0, 0.0),
+            cane_vel=(0.0, 0.0),
+            veh_pos=(0.0, 10.0),
+            veh_vel=(0.0, -10.0),
+        )
+        self.assertLessEqual(kin.ttc_simple, T_FLOOR_TTC_S)
+        result = assess_risk(kin, vehicle_speed_mps=10.0)
+        self.assertEqual(result.risk_level, 3)
+        self.assertEqual(result.reason, "safety_floor")
+
+    def test_cap_can_be_disabled_for_analysis(self):
+        """상한을 끈 채로 채점할 수 있어야 8/12 이전 데이터와 비교가 된다."""
+        kin = relative_kinematics(
+            cane_pos=(0.0, 0.0),
+            cane_vel=(0.0, 0.0),
+            veh_pos=(0.0, 8.0),
+            veh_vel=(0.0, 5.0),
+        )
+        result = assess_risk(kin, vehicle_speed_mps=5.0, alarm_max_ttc_s=0.0)
+        self.assertEqual(result.risk_level, 1)
+        self.assertEqual(result.reason, "table")
+
+    def test_cap_value_matches_the_pipeline_bound(self):
+        """지도 업로드(upload_events.MAX_TTC_S)와 같은 30초여야 한다.
+
+        판단에 의미가 있는 TTC 구간이 30초까지라는 결정(model_features.
+        TTC_MAX_S)을 세 곳이 공유한다. 갈라지면 화면·지도·경보가 서로
+        다른 기준으로 움직인다.
+        """
+        self.assertEqual(T_ALARM_MAX_TTC_S, 30.0)
+
+
+class ClosingDeadbandTest(unittest.TestCase):
+    """GPS 잡음 크기의 접근속도는 접근이 아니다.
+
+    8/17 오후 실측: 두 노드가 모두 서 있는데 KF 접근속도가 |중앙 0.04~0.19,
+    p90 0.22~0.7| m/s로 흔들렸다(패킷 좌표 float32 격자 0.42/0.53 m + GPS σ).
+    10 m 안에서는 그 잡음이 TTC 30초 경계(0.33 m/s)와 8초 경계(1.25 m/s)를
+    넘나들며 레벨 0↔1↔2를 깜빡이게 했다. 0.5 m/s 아래 접근속도는 잡음이므로
+    TTC를 내지 않는다. 진짜 접근(RC 1 m/s+, 실차 3 m/s+)은 그대로 통과하고,
+    코앞(near_floor)은 거리 규칙이 따로 지킨다.
+    """
+
+    def _still_pair_with_noise_closing(self, distance_m, closing_mps):
+        # 접근속도만 잡음으로 주어진 정지 쌍.
+        return relative_kinematics(
+            cane_pos=(0.0, 0.0),
+            cane_vel=(0.0, 0.0),
+            veh_pos=(0.0, distance_m),
+            veh_vel=(0.0, -closing_mps),
+        )
+
+    def test_noise_level_closing_speed_gives_no_ttc_and_no_alarm(self):
+        # 8 m, closing 0.3 m/s -> TTC 26.7초로 상한 안이라 레벨 1이 나던 경우.
+        kin = self._still_pair_with_noise_closing(8.0, 0.3)
+        result = assess_risk(kin, vehicle_speed_mps=0.1)
+        self.assertEqual(result.ttc, 9999.0)
+        self.assertEqual(result.risk_level, 0)
+        self.assertEqual(result.reason, "ttc_capped")
+
+    def test_the_measured_closing_speed_is_still_logged(self):
+        kin = self._still_pair_with_noise_closing(8.0, 0.3)
+        result = assess_risk(kin, vehicle_speed_mps=0.1)
+        self.assertAlmostEqual(result.closing_los, 0.3, places=6)
+
+    def test_closing_at_the_deadband_passes(self):
+        # 8 m, closing 0.5 m/s -> TTC 16초, 상한 안 -> 점수표대로 레벨 1.
+        kin = self._still_pair_with_noise_closing(8.0, MIN_CLOSING_MPS)
+        result = assess_risk(kin, vehicle_speed_mps=0.5)
+        self.assertAlmostEqual(result.ttc, 16.0, places=6)
+        self.assertEqual(result.reason, "table")
+        self.assertGreaterEqual(result.risk_level, 1)
+
+    def test_near_floor_is_unaffected_by_the_deadband(self):
+        kin = self._still_pair_with_noise_closing(2.5, 0.3)
+        result = assess_risk(kin, vehicle_speed_mps=0.1)
+        self.assertEqual(result.risk_level, 2)
+        self.assertEqual(result.reason, "near_floor")
+
+    def test_deadband_can_be_disabled_for_analysis(self):
+        kin = self._still_pair_with_noise_closing(8.0, 0.3)
+        result = assess_risk(kin, vehicle_speed_mps=0.1, min_closing_mps=0.0)
+        self.assertAlmostEqual(result.ttc, 8.0 / 0.3, places=6)
+        self.assertEqual(result.reason, "table")
+
+
+class DopplerBoundTest(unittest.TestCase):
+    """접근속도의 물리 상한 — 두 노드가 보고한 도플러 속도의 합보다 빨리 가까워질 수 없다.
+
+    8/18 실측: 차가 0.01~0.1 m/s로 서 있는데 KF 접근속도가 0.5~3 m/s(위치 드리프트)
+    → 6~16 m에서 주의/경고 유령. 그날 점수표 경보 356행 중 105행이
+    closing > 차속+지팡이속+0.3 이었고 그 99행이 둘 다 정지, 반대로 실제 접근
+    (차 ≥1 m/s) 154행 중 걸린 건 1행. 채점용 접근속도만 |closing| ≤ 도플러 합+여유로
+    자르고(그 뒤 데드밴드), 기록(closing_los)은 원값. 도플러 쌍이 None이면(둘 중
+    하나라도 GPS 무효) 도플러를 믿을 수 없으니 자르지 않는다. 호출자(step8)는 위치
+    추정이 도플러보다 2~3 s 늦는 것을 감안해 최근 몇 초의 최대 도플러를 넘긴다.
+    """
+
+    def _pair(self, distance_m, closing_mps):
+        return relative_kinematics(
+            cane_pos=(0.0, 0.0), cane_vel=(0.0, 0.0),
+            veh_pos=(0.0, distance_m), veh_vel=(0.0, -closing_mps),
+        )
+
+    def test_still_pair_with_drifting_closing_is_silent(self):
+        # 16:44:15 실측: d 6.9, closing 0.91, 차 0.01, 지팡이 0.03 → 경고 2 s 유령.
+        result = assess_risk(self._pair(6.9, 0.91), vehicle_speed_mps=0.01,
+                             doppler_speeds_mps=(0.01, 0.03))
+        self.assertEqual(result.ttc, 9999.0)
+        self.assertEqual(result.risk_level, 0)
+        self.assertEqual(result.reason, "ttc_capped")
+
+    def test_the_measured_closing_speed_is_still_logged(self):
+        result = assess_risk(self._pair(6.9, 0.91), vehicle_speed_mps=0.01,
+                             doppler_speeds_mps=(0.01, 0.03))
+        self.assertAlmostEqual(result.closing_los, 0.91, places=6)
+
+    def test_real_approach_is_not_clamped(self):
+        # 16:18:43 실측: d 6.2, closing 1.63, 차 1.66 → 경고(TTC 3.8)가 그대로여야 한다.
+        result = assess_risk(self._pair(6.2, 1.63), vehicle_speed_mps=1.66,
+                             doppler_speeds_mps=(1.66, 0.02))
+        self.assertAlmostEqual(result.ttc, 6.2 / 1.63, places=6)
+        self.assertEqual(result.reason, "table")
+        self.assertEqual(result.risk_level, 2)
+
+    def test_clamp_only_lowers_to_the_bound_and_a_fast_approach_still_alarms(self):
+        # 차 0.9 + 지팡이 0 + 여유 0.3 = 1.2 상한. closing 1.5 → 1.2로 채점, 5 m면 TTC 4.2 → 경고.
+        result = assess_risk(self._pair(5.0, 1.5), vehicle_speed_mps=0.9,
+                             doppler_speeds_mps=(0.9, 0.0))
+        self.assertAlmostEqual(result.ttc, 5.0 / (0.9 + 0.0 + CLOSING_DOPPLER_MARGIN_MPS), places=6)
+        self.assertEqual(result.risk_level, 2)
+
+    def test_no_doppler_speeds_means_no_clamp(self):
+        # 둘 중 하나라도 GPS 무효면 호출자가 None을 준다 → 이전 동작 그대로.
+        result = assess_risk(self._pair(6.9, 0.91), vehicle_speed_mps=0.01,
+                             doppler_speeds_mps=None)
+        self.assertAlmostEqual(result.ttc, 6.9 / 0.91, places=6)
+        self.assertEqual(result.reason, "table")
+
+    def test_still_pair_inside_the_floor_gets_near_floor_not_safety_floor(self):
+        # 서 있는 차 1.5 m 옆에서 closing 1.2가 튀면 어제는 TTC 1.25 → 위험(L3) 유령.
+        # 이제는 채점 접근속도가 잘려 TTC가 없고, 코앞 규칙(경고)만 남는다.
+        result = assess_risk(self._pair(1.5, 1.2), vehicle_speed_mps=0.02,
+                             doppler_speeds_mps=(0.02, 0.02))
+        self.assertEqual(result.risk_level, 2)
+        self.assertEqual(result.reason, "near_floor")
+
+    def test_the_bound_uses_the_given_speeds_not_the_table_vehicle_speed(self):
+        # 호출자는 지연을 감안한 최근 최대 도플러를 줄 수 있다: 표용 차속 0.1이라도
+        # 도플러 쌍 (1.0, 0.0)이면 상한 1.3 → closing 1.2가 그대로 채점된다.
+        result = assess_risk(self._pair(6.0, 1.2), vehicle_speed_mps=0.1,
+                             doppler_speeds_mps=(1.0, 0.0))
+        self.assertAlmostEqual(result.ttc, 6.0 / 1.2, places=6)
+        self.assertEqual(result.reason, "table")
+
+    def test_receding_is_flagged_only_when_the_bounded_closing_says_so(self):
+        # 지나간 차(도플러 1.5, closing −1.5) → receding. 서 있는 쌍의 드리프트 −0.9는
+        # 도플러 상한(0.35)에 잘려 receding 이 아니다(코앞 정지 경보가 깜빡이지 않게).
+        gone = assess_risk(self._pair(6.0, -1.5), vehicle_speed_mps=1.5,
+                           doppler_speeds_mps=(1.5, 0.0))
+        self.assertTrue(gone.receding)
+        drift = assess_risk(self._pair(2.0, -0.9), vehicle_speed_mps=0.02,
+                            doppler_speeds_mps=(0.02, 0.02))
+        self.assertFalse(drift.receding)
+        coming = assess_risk(self._pair(6.0, 1.5), vehicle_speed_mps=1.5,
+                             doppler_speeds_mps=(1.5, 0.0))
+        self.assertFalse(coming.receding)
+
+    def test_receding_without_doppler_uses_the_raw_closing(self):
+        result = assess_risk(self._pair(6.0, -1.5), vehicle_speed_mps=1.5,
+                             doppler_speeds_mps=None)
+        self.assertTrue(result.receding)
+
+    def test_margin_is_below_the_deadband_so_still_pairs_fall_under_it(self):
+        # 정지 쌍(도플러 합 ≈0.05)의 상한이 데드밴드 0.5 아래여야 유령이 사라진다.
+        self.assertEqual(CLOSING_DOPPLER_MARGIN_MPS, 0.3)
+        self.assertLess(CLOSING_DOPPLER_MARGIN_MPS + 0.1, MIN_CLOSING_MPS)
+
+
+class DistanceTrendTest(unittest.TestCase):
+    """느린 실접근 — 순간 접근속도는 데드밴드에 걸려도 거리가 꾸준히 줄면 잡는다.
+
+    2026-08-19 실기: 사용자가 차를 손에 들고 ~0.3 m/s로 걸어가 다가갔는데, 그 저속에서
+    KF 접근속도가 데드밴드(0.5) 아래라 미탐(놓친 5건). 거리는 확실히 줄었으므로, 최근
+    거리감소 추세가 TREND_MIN_MPS(0.62) 이상이면 그 값을 채점 접근속도로 쓴다. 실제
+    차량(≥1.4 m/s)은 이미 데드밴드를 넘어 이 경로가 필요 없다.
+    """
+
+    def _pair(self, distance_m, closing_mps):
+        return relative_kinematics(
+            cane_pos=(0.0, 0.0), cane_vel=(0.0, 0.0),
+            veh_pos=(0.0, distance_m), veh_vel=(0.0, -closing_mps),
+        )
+
+    def test_slow_sustained_approach_uses_the_trend_speed(self):
+        # 8 m, 순간 closing 0.1(데드밴드 아래) 인데 거리추세 0.7 m/s → TTC 8/0.7 ≈ 11.4
+        result = assess_risk(self._pair(8.0, 0.1), vehicle_speed_mps=0.1,
+                             trend_closing_mps=0.7)
+        self.assertAlmostEqual(result.ttc, 8.0 / 0.7, places=6)
+        self.assertEqual(result.reason, "table")
+        self.assertGreaterEqual(result.risk_level, 1)
+
+    def test_trend_below_threshold_is_ignored(self):
+        # 추세 0.4 < 0.62 → 잡음으로 보고 안 씀 (기존 데드밴드 동작)
+        result = assess_risk(self._pair(8.0, 0.1), vehicle_speed_mps=0.1,
+                             trend_closing_mps=0.4)
+        self.assertEqual(result.ttc, 9999.0)
+        self.assertEqual(result.risk_level, 0)
+
+    def test_trend_does_not_lower_a_real_fast_closing(self):
+        # 순간 접근 2.0(진짜 빠름)이면 추세 0.7이 그걸 깎지 않는다
+        result = assess_risk(self._pair(10.0, 2.0), vehicle_speed_mps=2.0,
+                             trend_closing_mps=0.7, doppler_speeds_mps=(2.0, 0.0))
+        self.assertAlmostEqual(result.ttc, 10.0 / 2.0, places=6)
+
+    def test_trend_default_off_keeps_old_behaviour(self):
+        # trend_closing_mps 안 주면(0) 기존 데드밴드 그대로
+        result = assess_risk(self._pair(8.0, 0.1), vehicle_speed_mps=0.1)
+        self.assertEqual(result.ttc, 9999.0)
+
+    def test_trend_can_be_disabled(self):
+        result = assess_risk(self._pair(8.0, 0.1), vehicle_speed_mps=0.1,
+                             trend_closing_mps=0.7, trend_min_mps=0.0)
+        self.assertEqual(result.ttc, 9999.0)
+
+    def test_a_positive_trend_overrides_a_momentary_receding(self):
+        # 순간 closing 음수(-0.6, GPS 잡음)라도 거리추세가 다가옴이면 receding 아님
+        result = assess_risk(self._pair(6.0, -0.6), vehicle_speed_mps=0.1,
+                             trend_closing_mps=0.7, doppler_speeds_mps=(0.1, 0.05))
+        self.assertFalse(result.receding)
+
+    def test_threshold_value(self):
+        self.assertEqual(TREND_MIN_MPS, 0.62)
+
+
+class NearFloorTest(unittest.TestCase):
+    """코앞 규칙 — 2026-08-17 통신 담당 확정: "2.5 m 안에서 다가올 때는 울리고, 멀어지면
+    안 울린다. 5 m쯤 떨어져 평행이면 울리지 말아야 한다."
+
+    접근속도가 잡음(데드밴드 0.5) 아래라 TTC가 안 나와도, 2.5 m 안에서 멀어지는
+    중이 아니면 레벨 2. 멀어지는 중(closing<0)이면 코앞이라도 울리지 않는다.
+    이전의 5 m 레벨-1 하한은 5 m 평행 통과를 울리게 하므로 없앤다.
+    """
+
+    def _pair(self, distance_m, closing_mps):
+        return relative_kinematics(
+            cane_pos=(0.0, 0.0), cane_vel=(0.0, 0.0),
+            veh_pos=(0.0, distance_m), veh_vel=(0.0, -closing_mps),
+        )
+
+    def test_slow_approach_inside_two_and_a_half_metres_is_level_2(self):
+        result = assess_risk(self._pair(2.0, 0.3), vehicle_speed_mps=0.3)
+        self.assertEqual(result.risk_level, 2)
+        self.assertEqual(result.reason, "near_floor")
+
+    def test_receding_inside_two_and_a_half_metres_is_silent(self):
+        result = assess_risk(self._pair(2.0, -0.3), vehicle_speed_mps=0.3)
+        self.assertEqual(result.risk_level, 0)
+        self.assertNotEqual(result.reason, "near_floor")
+
+    def test_standing_still_inside_two_and_a_half_metres_counts_as_not_receding(self):
+        result = assess_risk(self._pair(2.4, 0.0), vehicle_speed_mps=0.0)
+        self.assertEqual(result.risk_level, 2)
+        self.assertEqual(result.reason, "near_floor")
+
+    def test_parallel_pass_at_five_metres_is_silent(self):
+        # 5 m 옆으로 평행 통과: 접근속도 0, TTC 없음 → 이전 5 m 레벨-1 하한이 울리던 자리
+        result = assess_risk(self._pair(4.0, 0.0), vehicle_speed_mps=1.0)
+        self.assertEqual(result.risk_level, 0)
+        result = assess_risk(self._pair(5.0, 0.0), vehicle_speed_mps=1.0)
+        self.assertEqual(result.risk_level, 0)
+
+    def test_just_outside_the_floor_is_left_to_the_table(self):
+        result = assess_risk(self._pair(2.6, 0.3), vehicle_speed_mps=0.3)
+        self.assertEqual(result.risk_level, 0)
+        self.assertEqual(result.reason, "ttc_capped")
+
+    def test_safety_floor_still_wins_over_the_near_floor(self):
+        result = assess_risk(self._pair(1.0, 1.0), vehicle_speed_mps=1.0)
+        self.assertEqual(result.risk_level, 3)
+        self.assertEqual(result.reason, "safety_floor")
+
+    def test_floor_distance_is_two_and_a_half_metres(self):
+        self.assertEqual(NEAR_FLOOR_M, 2.5)
+
+
+class SafetyFloorTest(unittest.TestCase):
+    """TTC가 반응 가능 시간 아래로 내려가면 점수와 무관하게 최고 레벨이 나간다.
+
+    근거는 ttc_study/SPEC.md에 정리되어 있다. T_FLOOR_TTC_S는 GPS 주기 + 전송
+    0.1(8/5 실측) + 인지·판단 0.3 + 정지 동작 1.2 + 마진 0.2의 합이다.
+
+    2026-08-08 실측으로 GPS 주기를 1.0초(차량 1045 ms)로 잡으면서 하한이
+    2.0 -> 2.8초가 되었다. 아래 테스트가 상수를 직접 참조하는 것은 이 때문이다 -
+    값을 적어두면 GPS 주기가 바뀔 때마다 테스트가 함께 틀린다.
+
+    시뮬레이션 검증(1200 x 3회, 평가 기준 2.8초): 하한 2.0은 하한 없음과 적시경보가
+    52.2%로 같아 오경보만 늘린다. 2.8초에서 57.7%로 오르고 오경보는 3.36 ->
+    4.75%가 된다. 놓치지 않는 쪽에 비용을 쓰는 것이 이 규칙의 목적이다.
+    """
+
+    def test_imminent_collision_forces_top_level(self):
+        # 10 m 앞에서 10 m/s로 정면 접근 -> TTC 1.0초
+        kin = relative_kinematics(
+            cane_pos=(0.0, 0.0),
+            cane_vel=(0.0, 0.0),
+            veh_pos=(0.0, 10.0),
+            veh_vel=(0.0, -10.0),
+        )
+        self.assertLessEqual(kin.ttc_simple, T_FLOOR_TTC_S)
+
+        result = assess_risk(kin, vehicle_speed_mps=10.0)
+
+        self.assertEqual(result.risk_level, 3)
+
+    def test_floor_overrides_the_dcpa_gate(self):
+        """게이트가 점수를 깎아도 하한은 무시하고 발동한다.
+
+        게이트는 '스쳐 갈 차'를 걸러내는 장치인데, 그 판단 자체가 추정이다.
+        접촉까지 2초도 남지 않은 상황에서는 추정이 틀렸을 때의 대가가 너무 크다.
+        """
+        kin = relative_kinematics(
+            cane_pos=(0.0, 0.0),
+            cane_vel=(0.0, 0.0),
+            veh_pos=(8.0, 6.0),
+            veh_vel=(-4.0, -3.0),
+        )
+        self.assertLessEqual(kin.ttc_simple, T_FLOOR_TTC_S)
+
+        result = assess_risk(kin, vehicle_speed_mps=5.0)
+
+        self.assertEqual(result.risk_level, 3)
+        self.assertEqual(result.reason, "safety_floor")
+
+    def test_above_the_floor_nothing_changes(self):
+        """하한 위에서는 기존 채점이 그대로다."""
+        kin = relative_kinematics(
+            cane_pos=(0.0, 0.0),
+            cane_vel=(0.0, 0.0),
+            veh_pos=(0.0, 50.0),
+            veh_vel=(0.0, -10.0),
+        )
+        self.assertGreater(kin.ttc_simple, T_FLOOR_TTC_S)
+
+        result = assess_risk(kin, vehicle_speed_mps=10.0)
+
+        self.assertEqual(result.risk_level, classify_risk_level(result.final_score))
+        self.assertEqual(result.reason, "table")
+
+    def test_receding_vehicle_never_triggers_the_floor(self):
+        """멀어지는 차는 TTC가 없으므로 하한이 걸리지 않는다."""
+        kin = relative_kinematics(
+            cane_pos=(0.0, 0.0),
+            cane_vel=(0.0, 0.0),
+            veh_pos=(0.0, 3.0),
+            veh_vel=(0.0, 5.0),
+        )
+        self.assertIsNone(kin.ttc_simple)
+
+        result = assess_risk(kin, vehicle_speed_mps=5.0)
+
+        self.assertNotEqual(result.reason, "safety_floor")
+
+    def test_floor_can_be_disabled_for_analysis(self):
+        """하한을 끈 채로도 채점할 수 있어야 전후 비교가 가능하다."""
+        kin = relative_kinematics(
+            cane_pos=(0.0, 0.0),
+            cane_vel=(0.0, 0.0),
+            veh_pos=(0.0, 10.0),
+            veh_vel=(0.0, -10.0),
+        )
+
+        result = assess_risk(kin, vehicle_speed_mps=10.0, floor_ttc_s=0.0)
+
+        self.assertEqual(result.reason, "table")
+
+
+if __name__ == "__main__":
+    unittest.main()
