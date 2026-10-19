@@ -1,6 +1,6 @@
 # Field Results
 
-> 🇰🇷 [한국어 버전](field-results.ko.md) · back to [← README.md](../README.md)
+> 🇰🇷 [한국어 버전](field-results.ko.md) · back to [← README.en.md](../README.en.md)
 
 Not lab numbers — **logs recorded on a real road.** Every figure below is generated **without hand-editing** from the raw CSVs in [`data/`](../data/); the generation scripts are included too.
 
